@@ -1,11 +1,9 @@
-# CSC481-581Project
-The Game Engine Construction Project is designed to help you gain comprehensive, hands-on experience in the design, development, integration, and testing of a functional game engine. You will also implement individual games using your team engine to showcase system functionalities. This project allows you to develop and demonstrate competencies in game engine architecture, system implementation, and problem-solving as applied to real-world game development scenarios.
+# CSC481 Individual Project - Bunny Hop
+Bunny Hop is an individual game created for the CSC 481 Game Engine Construction Project. The game uses the engine foundation developed by Team 8 and demonstrates entity management, configurable physics, keyboard input, collision detection, animation, and display scaling.
 
-## Team 8
+The player controls a bunny that can walk, run, and jump. The bunny must avoid a rock and cross the gap between the two platforms. Falling into the gap causes the game to reset.
 
-Sabah Afroz, safroz
-
-Mia Glenn, mglenn2
+## Author
 
 Tram Nguyen, tnnguy22
 
@@ -16,7 +14,7 @@ Follow these steps to clone, build, and run the project on your machine:
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/mglenn001/CSC481-581Project.git
+git clone https://github.com/tramnguyen1712/CSC481-Individual-Project.git
 ```
 
 ----------
