@@ -11,20 +11,11 @@
 const int WINDOW_WIDTH = 1920;
 const int WINDOW_HEIGHT = 1080;
 
-// enemy_skull.png: 192x32 total, 6 frames of 32x32, 8fps
-const int SKULL_FRAME_COUNT = 6;
-const int SKULL_FRAME_W = 32;
-const int SKULL_FRAME_H = 32;
+// bunny, cloud, and sun each contain 4 horizonal frames
+const int FRAME_COUNT = 4;
+const int FRAME_WIDTH = 543;
+const int FRAME_HEIGHT = 724;
 
-// swirlingorb.png: 512x128 total, 4 frames of 128x128, 6fps
-const int PORTAL_FRAME_COUNT = 4;
-const int PORTAL_FRAME_W = 128;
-const int PORTAL_FRAME_H = 128;
-
-// totem.png: 512x192 total, 8 frames of 64x192, 8fps
-const int TOTEM_FRAME_COUNT = 8;
-const int TOTEM_FRAME_W = 64;
-const int TOTEM_FRAME_H = 192;
 
 int main(int argc, char *argv[])
 {
@@ -39,7 +30,7 @@ int main(int argc, char *argv[])
     SDL_Renderer *renderer = nullptr;
 
     if (!SDL_CreateWindowAndRenderer(
-            "Game Engine",
+            "Bunny Hop",
             WINDOW_WIDTH,
             WINDOW_HEIGHT,
             SDL_WINDOW_RESIZABLE,
@@ -51,119 +42,199 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    int actualWidth;
-    int actualHeight;
+    // Set the reference resolution for proportional scaling
+    Scaling::setReferenceResolution(WINDOW_WIDTH, WINDOW_HEIGHT);
 
-    SDL_GetWindowSize(
-        window,
-        &actualWidth,
-        &actualHeight
+
+    // game measuments
+    const float LAND_Y = 760.0f;
+    const float GROUND_Y = 840.0f;
+
+    const float GAP_START = 970.0f;
+    const float GAP_END = 1210.0f;
+
+    const float BUNNY_WIDTH = 220.0f;
+    const float BUNNY_HEIGHT = 280.0f;
+
+    const float START_X = 170.0f;
+    const float START_Y = GROUND_Y - BUNNY_HEIGHT;
+
+    const float WALK_SPEED = 350.0f;
+    const float RUN_SPEED = 600.0f;
+    const float JUMP_STRENGTH = 700.0f;
+
+    // Create generic entity
+    Entity bunny(START_X, START_Y, BUNNY_WIDTH, BUNNY_HEIGHT);
+
+    // Controllable entity: player (bunny)
+    bunny.setGravityEnabled(true);
+    bunny.setGrounded(true); // Start on the ground
+    bunny.setSpriteSheet(FRAME_COUNT, FRAME_WIDTH, FRAME_HEIGHT);
+    bunny.setAnimationSpeed(8.0f);
+
+    // Static entity: rock
+    Entity rock(
+        650.0f,
+        GROUND_Y - 140.0f,
+        165.0f,
+        140.0f
     );
 
-    // Set the reference resolution for proportional scaling
-    Scaling::setReferenceResolution(actualWidth, actualHeight);
+    rock.setGravityEnabled(false);
 
-    // Tracks whether the scale toggle key was pressed in the previous frame
-    bool scaleKeyWasPressed = false;
+    // Automatically moving entity: cloud
+    Entity cloud(
+        350.0f,
+        100.0f,
+        500.0f,
+        280.0f
+    );
 
-    const float GROUND_Y = actualHeight - 150.0f;
+    cloud.setGravityEnabled(false);
+    cloud.setSpriteSheet(
+        FRAME_COUNT,
+        FRAME_WIDTH,
+        FRAME_HEIGHT
+    );
+    cloud.setAnimationSpeed(4.0f);
 
-    const float BRICK_WIDTH = 96.0f;
-    const float BRICK_HEIGHT = 32.0f;
+    // Decorative animated sun
+    Entity sun(
+        1250.0f,
+        100.0f,
+        310.0f,
+        310.0f
+    );
 
-    // Area with no bricks
-    const float GAP_START = 900.0f;
-    const float GAP_END = 1200.0f;
+    sun.setGravityEnabled(false);
+    sun.setSpriteSheet(
+        FRAME_COUNT,
+        FRAME_WIDTH,
+        FRAME_HEIGHT
+    );
+    sun.setAnimationSpeed(5.0f);
 
-    const float START_X = 100.0f;
-    const float START_Y = 100.0f;
 
-    // Create one generic entity
-    Entity player(START_X, START_Y, 200.0f, 200.0f);
+    // Two ground sections create the gap.
+    Entity leftLand(
+        0.0f,
+        LAND_Y,
+        GAP_START,
+        320.0f
+    );
 
-    // Create a Physics instance
-    Physics physics;
+    Entity rightLand(
+        GAP_END,
+        LAND_Y,
+        WINDOW_WIDTH - GAP_END,
+        320.0f
+    );
 
-    // Enable gravity for the player
-    player.setGravityEnabled(true);
-    physics.setGravity(900.0f); // Set gravity strength (pixels per second squared)
+    leftLand.setGravityEnabled(false);
+    rightLand.setGravityEnabled(false);
 
-    const float PORTAL_SPAWN_X = START_X;
-    const float PORTAL_SPAWN_Y = GROUND_Y - player.getHeight();
+    // Entity: Tree
+    Entity tree(
+        1500.0f,
+        GROUND_Y - 360.0f,
+        300.0f,
+        360.0f
+    );
 
-    // Totem: static object, player must jump over it
-    Entity totem(400.0f, GROUND_Y - TOTEM_FRAME_H, (float)TOTEM_FRAME_W, (float)TOTEM_FRAME_H);
-    totem.setGravityEnabled(false); // it's static, it never moves
+    tree.setGravityEnabled(false);
+    tree.setSpriteSheet(
+        FRAME_COUNT,
+        FRAME_WIDTH,
+        FRAME_HEIGHT
+    );
 
-    // Enemy skull: auto-moving patrol enemy, floats (no gravity)
-    Entity enemySkull(GAP_START, GROUND_Y - 150.0f, (float)SKULL_FRAME_W, (float)SKULL_FRAME_H);
-    enemySkull.setGravityEnabled(false);
-    float skullPatrolMinX = GAP_START;
-    float skullPatrolMaxX = GAP_END;
-    float skullSpeed = 150.0f;
-    int skullDirection = 1; // 1 = right, -1 = left
+    tree.setAnimationSpeed(3.0f);
 
-    // Portal: purely visual "respawn point" marker
-    Entity portal(START_X - 40.0f, GROUND_Y - PORTAL_FRAME_H, (float)PORTAL_FRAME_W, (float)PORTAL_FRAME_H);
-    portal.setGravityEnabled(false);
 
-    // Load the player's sprite texture
-    SDL_Texture* playerTexture =
-        IMG_LoadTexture(renderer, "../assets/darkworld_enemy_nyx_idle.png");
+    // Load textures
+    SDL_Texture* bunnyTexture =
+        IMG_LoadTexture(renderer, "../assets/bunny.png");
+
+    SDL_Texture* cloudTexture =
+        IMG_LoadTexture(renderer, "../assets/cloud.png");
+
+    SDL_Texture* sunTexture =
+        IMG_LoadTexture(renderer, "../assets/sun.png");
+
+    SDL_Texture* landTexture =
+        IMG_LoadTexture(renderer, "../assets/land.png");
+
+    SDL_Texture* rockTexture =
+        IMG_LoadTexture(renderer, "../assets/rock.png");
+    
+    SDL_Texture* treeTexture =
+        IMG_LoadTexture(renderer, "../assets/tree.png");
+
 
     // Check if the texture loaded correctly
-    if (!playerTexture) {
+    if (!bunnyTexture) {
         SDL_Log("Could not load texture: %s", SDL_GetError());
     }
     else {
-        player.setTexture(playerTexture);
-
-        // Tell the entity how the sprite sheet is arranged
-        player.setSpriteSheet(8, 128, 128);
+        bunny.setTexture(bunnyTexture);
     }
 
-    // Load the brick
-    SDL_Texture* brickTexture =
-        IMG_LoadTexture(
-            renderer,
-            "../assets/brick.png"
-        );
-
-    if (!brickTexture) {
-        SDL_Log(
-            "Could not load brick texture: %s",
-            SDL_GetError()
+    if (!cloudTexture) {
+        SDL_Log("Could not load cloud texture: %s",SDL_GetError()
         );
     }
-
-    // Load and assign totem textures/sprite sheets
-    SDL_Texture* totemTexture = IMG_LoadTexture(renderer, "../assets/totem.png");
-    if (totemTexture) {
-        totem.setTexture(totemTexture);
-        totem.setSpriteSheet(TOTEM_FRAME_COUNT, TOTEM_FRAME_W, TOTEM_FRAME_H);
-        totem.setAnimationSpeed(8.0f);
+    else {
+        cloud.setTexture(cloudTexture);
     }
 
-    // Load and assign skull textures/sprite sheets
-    SDL_Texture* skullTexture = IMG_LoadTexture(renderer, "../assets/enemy_skull.png");
-    if (skullTexture) {
-        enemySkull.setTexture(skullTexture);
-        enemySkull.setSpriteSheet(SKULL_FRAME_COUNT, SKULL_FRAME_W, SKULL_FRAME_H);
-        enemySkull.setAnimationSpeed(8.0f);
+    if (!sunTexture) {
+        SDL_Log("Could not load sun texture: %s", SDL_GetError());
+    }
+    else {
+        sun.setTexture(sunTexture);
     }
 
-    // Load and assign portal textures/sprite sheets
-    SDL_Texture* portalTexture = IMG_LoadTexture(renderer, "../assets/swirlingorb.png");
-    if (portalTexture) {
-        portal.setTexture(portalTexture);
-        portal.setSpriteSheet(PORTAL_FRAME_COUNT, PORTAL_FRAME_W, PORTAL_FRAME_H);
-        portal.setAnimationSpeed(6.0f);
+    if (!landTexture) {
+        SDL_Log("Could not load land texture: %s", SDL_GetError());
     }
+    else {
+        leftLand.setTexture(landTexture);
+        rightLand.setTexture(landTexture);
+    }
+
+    if (!rockTexture) {
+        SDL_Log("Could not load rock texture: %s", SDL_GetError());
+    }
+    else {
+        rock.setTexture(rockTexture);
+    }
+
+    if (!treeTexture) {
+        SDL_Log("Could not load tree texture: %s", SDL_GetError());
+    }
+    else {
+        tree.setTexture(treeTexture);
+    }
+
+
+    // Physics and game state
+    Physics physics;
+    physics.setGravity(1000.0f); 
+
+    float cloudSpeed = 90.0f;
+    int cloudDirection = 1;
+
+    const float CLOUD_MIN_X = 250.0f;
+    const float CLOUD_MAX_X = 900.0f;
 
     bool running = true;
-    SDL_Event event;
+    bool gameOver = false;
+    bool scalingKeyWasPressed = false;
 
+    SDL_Event event;
     Uint64 lastTime = SDL_GetTicks();
+
+
     // Main game loop
     while (running) {
 
@@ -178,224 +249,243 @@ int main(int argc, char *argv[])
         float deltaTime = (currentTime - lastTime) / 1000.0f;
         lastTime = currentTime;
 
+        // Prevent large movements after pausing or dragging window.
+        if (deltaTime > 0.05f) {
+            deltaTime = 0.05f;
+        }
+
+        // Toggle scaling with T
+        bool scalingKeyIsPressed =
+            Input::isKeyPressed(SDL_SCANCODE_T);
+
+        if (scalingKeyIsPressed && !scalingKeyWasPressed) {
+            Scaling::toggleMode();
+
+            SDL_Log(
+                "Scaling mode: %s",
+                Scaling::getMode() == ScalingMode::PROPORTIONAL
+                    ? "PROPORTIONAL"
+                    : "PIXEL"
+            );
+        }
+
+        scalingKeyWasPressed = scalingKeyIsPressed;
+
+        // Restart after falling to the gap by pressing R.
+        if (gameOver && Input::isKeyPressed(SDL_SCANCODE_R)) {
+            bunny.setPosition(START_X, START_Y);
+            bunny.setVelocity(0.0f, 0.0f);
+            bunny.setGrounded(true);
+            gameOver = false;
+
+            SDL_Log("Game restarted!");
+        }
+
         // A: walk left
         // D: walk right
         // W: jump
-        // S: crouch
-        // Space: Attack
         // W + A: jump left
         // W + D: jump right
         // Shift + A: run left
         // Shift + D: run right
 
-        // Toggle scaling mode with the T key
-        bool scaleKeyIsPressed = Input::isKeyPressed(SDL_SCANCODE_T);
-        if (scaleKeyIsPressed && !scaleKeyWasPressed) {
-            Scaling::toggleMode();
-            SDL_Log(
-                "Scaling mode: %s",
-                (Scaling::getMode() == ScalingMode::PROPORTIONAL) ? "PROPORTIONAL" : "PIXEL"
-            );
-        }
-        scaleKeyWasPressed = scaleKeyIsPressed;
+        if (!gameOver) {
+            float previousX = bunny.getX();
+            // Walk normally and run while either Shift key is held.
+            float moveSpeed = WALK_SPEED;
 
-        // Input for Jumping (W key)
-        if (Input::isKeyPressed(SDL_SCANCODE_W)) {
-            physics.jump(player, 650.0f);
-        }
+            // Shift key held down increases speed to run
+            if (Input::isKeyPressed(SDL_SCANCODE_LSHIFT) || Input::isKeyPressed(SDL_SCANCODE_RSHIFT)) {
+                moveSpeed = RUN_SPEED;
+            }
 
-        const float WALK_SPEED = 300.0f;
-        const float RUN_SPEED = 550.0f;
-        float moveSpeed = WALK_SPEED;
-
-        // Input for moving left and right (A and D keys)
-        if (Input::isKeyPressed(SDL_SCANCODE_LSHIFT) ||
-            Input::isKeyPressed(SDL_SCANCODE_RSHIFT)) {
-            moveSpeed = RUN_SPEED;
-        }
-
-        if (Input::isKeyPressed(SDL_SCANCODE_A)) {
-            player.move(-moveSpeed * deltaTime, 0.0f);
-        }
-
-        if (Input::isKeyPressed(SDL_SCANCODE_D)) {
-            player.move(moveSpeed * deltaTime, 0.0f);
-        }
-
-        // Input for crouching (S key)
-        if (Input::isKeyPressed(SDL_SCANCODE_S)) {
-            SDL_Log("S pressed - down/crouch action");
-        }
-
-        // Input for attacking (Space key)
-        if (Input::isKeyPressed(SDL_SCANCODE_SPACE)) {
-            SDL_Log("Attack!");
-        }
-
-        // Update physics
-        physics.update(player, deltaTime);
-
-        // Ground check
-        float playerLeft = player.getX();
-
-        float playerRight = player.getX() + player.getWidth();
-
-        bool overGap = playerRight > GAP_START && playerLeft < GAP_END;
-
-        // If player is NOT over the gap,
-        // let them land on the brick ground
-        if (
-            !overGap &&
-            player.getY() + player.getHeight() >= GROUND_Y &&
-            player.getVelocityY() >= 0.0f
-        ) {
-
-            player.setPosition(
-                player.getX(),
-                GROUND_Y - player.getHeight()
-            );
-
-            player.setVelocityY(0.0f);
-
-            player.setGrounded(true);
-        }
-        else {
-            player.setGrounded(false);
-        }
-
-        // Fail/Reset
-        if (player.getY() > actualHeight) {
-
-            SDL_Log(
-                "Player fell! Respawning at the portal."
-            );
-
-            player.setPosition(
-                PORTAL_SPAWN_X,
-                PORTAL_SPAWN_Y
-            );
-
-            player.setVelocity(
-                0.0f,
-                0.0f
-            );
-
-            player.setGrounded(true);
-        }
-
-        // Collision: totem blocks the player like a wall
-        if (Collision::checkCollision(player, totem)) {
+            // A moves left
             if (Input::isKeyPressed(SDL_SCANCODE_A)) {
-                player.move(moveSpeed * deltaTime, 0.0f);
+                bunny.move(-moveSpeed * deltaTime, 0.0f);
             }
+
+            // D moves right
             if (Input::isKeyPressed(SDL_SCANCODE_D)) {
-                player.move(-moveSpeed * deltaTime, 0.0f);
-            }
-        }
-
-        // Collision: enemy (ex: skull) sends player (ex: nxy) back to the portal
-        if (Collision::checkCollision(player, enemySkull)) {
-            SDL_Log("Player touched an enemy! Respawning at the portal.");
-            player.setPosition(
-                PORTAL_SPAWN_X,
-                PORTAL_SPAWN_Y
-            );
-            player.setVelocity(
-                0.0f,
-                0.0f
-            );
-            player.setGrounded(true);
-        }
-
-        // Enemy patrol movement
-        enemySkull.move(skullSpeed * skullDirection * deltaTime, 0.0f);
-        if (enemySkull.getX() >= skullPatrolMaxX) {
-            skullDirection = -1;
-        }
-        if (enemySkull.getX() <= skullPatrolMinX) {
-            skullDirection = 1;
-        }
-
-        // Set background color to sage green
-        SDL_SetRenderDrawColor(renderer, 169, 186, 157, 255);
-
-        // Clear previous frame
-        SDL_RenderClear(renderer);
-
-        // Render the brick ground
-        if (brickTexture) {
-            float groundScaleX = 1.0f;
-            float groundScaleY = 1.0f;
-            
-            if (Scaling::getMode() == ScalingMode::PROPORTIONAL) {
-                int windowWidth = 0;
-                int windowHeight = 0;
-                SDL_GetRenderOutputSize(renderer, &windowWidth, &windowHeight);
-                Scaling::getScaleFactors(windowWidth, windowHeight, groundScaleX, groundScaleY);
+                bunny.move(moveSpeed * deltaTime, 0.0f);
             }
 
-            for (
-                float x = 0.0f;
-                x < WINDOW_WIDTH;
-                x += BRICK_WIDTH
-            ) {
+            // W jumps
+            if (Input::isKeyPressed(SDL_SCANCODE_W)) {
+                physics.jump(bunny, JUMP_STRENGTH);
+            }
 
-                // Leave a gap in the ground
-                if (
-                    x + BRICK_WIDTH > GAP_START &&
-                    x < GAP_END
-                ) {
-                    continue;
-                }
+            // Keep the bunny inside the left and right boundaries.
+            if (bunny.getX() < 0.0f) {
+                bunny.setPosition(0.0f, bunny.getY());
+            }
 
-                SDL_FRect brickRect = {
-                    x * groundScaleX,
-                    GROUND_Y * groundScaleY,
-                    BRICK_WIDTH * groundScaleX,
-                    BRICK_HEIGHT * groundScaleY
-                };
+            if (bunny.getX() + bunny.getWidth() > WINDOW_WIDTH) {
+                bunny.setPosition(
+                    WINDOW_WIDTH - bunny.getWidth(),
+                    bunny.getY()
+                );
+            }
 
-                SDL_RenderTexture(
-                    renderer,
-                    brickTexture,
-                    nullptr,
-                    &brickRect
+            physics.update(bunny, deltaTime);
+
+
+            // Ground and gap detection
+            float bunnyLeft = bunny.getX();
+            float bunnyRight =
+                bunny.getX() + bunny.getWidth();
+            float bunnyBottom =
+                bunny.getY() + bunny.getHeight();
+
+            // Bunny is completely inside the gap when it has
+            // moved past the left platform and has not reached
+            // the right platform.
+            float bunnyCenterX =
+                bunny.getX() + bunny.getWidth() / 2.0f;
+
+            bool overGap =
+                bunnyCenterX > GAP_START &&
+                bunnyCenterX < GAP_END;
+
+            if (!overGap &&
+                bunnyBottom >= GROUND_Y &&
+                bunny.getVelocityY() >= 0.0f) {
+
+                bunny.setPosition(
+                    bunny.getX(),
+                    GROUND_Y - bunny.getHeight()
+                );
+
+                bunny.setVelocityY(0.0f);
+                bunny.setGrounded(true);
+            }
+            else {
+                bunny.setGrounded(false);
+            }
+
+            // Collision response: rock blocks the bunny
+            if (Collision::checkCollision(bunny, rock)) {
+                bunny.setPosition(previousX, bunny.getY());
+            }
+
+
+            // Falling into the gap causes game over
+            if (bunny.getY() > WINDOW_HEIGHT) {
+                gameOver = true;
+                bunny.setVelocity(0.0f, 0.0f);
+
+                SDL_Log(
+                    "GAME OVER! Press R to restart."
                 );
             }
         }
 
-        // Update the sprite animation
-        player.updateAnimation();
-        enemySkull.updateAnimation(deltaTime);
-        totem.updateAnimation(deltaTime);
-        portal.updateAnimation(deltaTime);
+        // Automatically move the cloud
+        cloud.move(
+            cloudSpeed * cloudDirection * deltaTime,
+            0.0f
+        );
 
-        // Render the entity
-        portal.render(renderer);
-        totem.render(renderer);
-        enemySkull.render(renderer);
-        player.render(renderer);
+        if (cloud.getX() >= CLOUD_MAX_X) {
+            cloud.setPosition(CLOUD_MAX_X, cloud.getY());
+            cloudDirection = -1;
+        }
+        else if (cloud.getX() <= CLOUD_MIN_X) {
+            cloud.setPosition(CLOUD_MIN_X, cloud.getY());
+            cloudDirection = 1;
+        }
 
-        // Show the frame
+
+        // Update sprite animations
+        bunny.updateAnimation(deltaTime);
+        cloud.updateAnimation(deltaTime);
+        sun.updateAnimation(deltaTime);
+        tree.updateAnimation(deltaTime);
+
+
+        // Pink and White ombre gradient background
+        const int BACKGROUND_BANDS = 40;
+        const float BAND_HEIGHT =
+            static_cast<float>(WINDOW_HEIGHT) /
+            BACKGROUND_BANDS;
+
+        for (int i = 0; i < BACKGROUND_BANDS; i++) {
+            float amount =
+                static_cast<float>(i) /
+                static_cast<float>(BACKGROUND_BANDS - 1);
+
+            Uint8 red = 255;
+            Uint8 green =
+                static_cast<Uint8>(250.0f - 55.0f * amount);
+            Uint8 blue =
+                static_cast<Uint8>(252.0f - 35.0f * amount);
+
+            SDL_SetRenderDrawColor(
+                renderer,
+                red,
+                green,
+                blue,
+                255
+            );
+
+            SDL_FRect band = {
+                0.0f,
+                i * BAND_HEIGHT,
+                static_cast<float>(WINDOW_WIDTH),
+                BAND_HEIGHT + 1.0f
+            };
+
+            SDL_RenderFillRect(renderer, &band);
+        }
+
+        // Render the game scene
+        cloud.render(renderer);
+        sun.render(renderer);
+
+        leftLand.render(renderer);
+        rightLand.render(renderer);
+        tree.render(renderer);
+        rock.render(renderer);
+
+        if (!gameOver) {
+            bunny.render(renderer);
+        }
+
+        // Pink overlay when the game is over.
+        if (gameOver) {
+            SDL_SetRenderDrawBlendMode(
+                renderer,
+                SDL_BLENDMODE_BLEND
+            );
+
+            SDL_SetRenderDrawColor(
+                renderer,
+                255,
+                180,
+                205,
+                110
+            );
+
+            SDL_FRect overlay = {
+                0.0f,
+                0.0f,
+                static_cast<float>(WINDOW_WIDTH),
+                static_cast<float>(WINDOW_HEIGHT)
+            };
+
+            SDL_RenderFillRect(renderer, &overlay);
+        }
+
         SDL_RenderPresent(renderer);
     }
 
+
     // Clean up
-    if (playerTexture) {
-        SDL_DestroyTexture(playerTexture);
-    }
-    if (brickTexture) {
-        SDL_DestroyTexture(brickTexture);
-    }
-    if (totemTexture) {
-        SDL_DestroyTexture(totemTexture);
-    }
-    if (skullTexture) {
-        SDL_DestroyTexture(skullTexture);
-    }
-    if (portalTexture) {
-        SDL_DestroyTexture(portalTexture);
-    }
+    SDL_DestroyTexture(bunnyTexture);
+    SDL_DestroyTexture(cloudTexture);
+    SDL_DestroyTexture(sunTexture);
+    SDL_DestroyTexture(landTexture);
+    SDL_DestroyTexture(rockTexture);
+    SDL_DestroyTexture(treeTexture);
 
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
