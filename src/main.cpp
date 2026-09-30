@@ -2,494 +2,509 @@
 #include <SDL3/SDL_main.h>
 #include <SDL3_image/SDL_image.h>
 
-#include "Entity.h"
-#include "Physics.h"
-#include "Input.h"
+#include <functional>
+#include <string>
+#include <thread>
+
 #include "Collision.h"
+#include "Entity.h"
+#include "Input.h"
+#include "Networking.h"
+#include "Physics.h"
 #include "Scaling.h"
+#include "SharedData.h"
+#include "Timeline.h"
 
-const int WINDOW_WIDTH = 1920;
-const int WINDOW_HEIGHT = 1080;
+namespace {
+constexpr int WINDOW_WIDTH = 1920;
+constexpr int WINDOW_HEIGHT = 1080;
+constexpr int CHARACTER_FRAME_COUNT = 4;
+constexpr int CHARACTER_FRAME_WIDTH = 543;
+constexpr int CHARACTER_FRAME_HEIGHT = 724;
+constexpr int CLOUD_SUN_FRAME_WIDTH = 512;
+constexpr int CLOUD_SUN_FRAME_HEIGHT = 682;
+constexpr int TREE_FRAME_WIDTH = 512;
+constexpr int TREE_FRAME_HEIGHT = 744;
 
-// bunny, cloud, and sun each contain 4 horizonal frames
-const int FRAME_COUNT = 4;
-const int FRAME_WIDTH = 543;
-const int FRAME_HEIGHT = 724;
-
-
-int main(int argc, char *argv[])
+SDL_Texture* loadTexture(SDL_Renderer* renderer, const char* path)
 {
-    // Initialize SDL
+    SDL_Texture* texture = IMG_LoadTexture(renderer, path);
+    if (!texture) {
+        SDL_Log("Could not load %s: %s", path, SDL_GetError());
+    }
+    return texture;
+}
+
+const char* characterName(int clientID)
+{
+    if (clientID == 1) return "Bunny";
+    if (clientID == 2) return "Fox";
+    return "Cat";
+}
+} // namespace
+
+int main(int argc, char* argv[])
+{
+    if (argc < 2) {
+        SDL_Log("Usage: ./main <clientID 1-3>");
+        return 1;
+    }
+
+    int clientID = 0;
+    try {
+        clientID = std::stoi(argv[1]);
+    }
+    catch (...) {
+        SDL_Log("Client ID must be 1, 2, or 3");
+        return 1;
+    }
+
+    if (clientID < 1 || clientID > 3) {
+        SDL_Log("Client ID must be 1, 2, or 3");
+        return 1;
+    }
+
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         SDL_Log("Could not initialize SDL: %s", SDL_GetError());
         return 1;
     }
 
-    // Create window and renderer
-    SDL_Window *window = nullptr;
-    SDL_Renderer *renderer = nullptr;
+    const std::string windowTitle =
+        "Bunny Hop - Client " + std::to_string(clientID) +
+        " - " + characterName(clientID);
 
+    SDL_Window* window = nullptr;
+    SDL_Renderer* renderer = nullptr;
     if (!SDL_CreateWindowAndRenderer(
-            "Bunny Hop",
+            windowTitle.c_str(),
             WINDOW_WIDTH,
             WINDOW_HEIGHT,
             SDL_WINDOW_RESIZABLE,
             &window,
             &renderer)) {
-
         SDL_Log("Could not create window/renderer: %s", SDL_GetError());
         SDL_Quit();
         return 1;
     }
 
-    // Set the reference resolution for proportional scaling
     Scaling::setReferenceResolution(WINDOW_WIDTH, WINDOW_HEIGHT);
 
+    constexpr float LAND_Y = 760.0f;
+    constexpr float GROUND_Y = 840.0f;
+    constexpr float GAP_START = 970.0f;
+    constexpr float GAP_END = 1210.0f;
+    constexpr float PLAYER_WIDTH = 220.0f;
+    constexpr float PLAYER_HEIGHT = 280.0f;
+    constexpr float START_X = 170.0f;
+    constexpr float START_Y = GROUND_Y - PLAYER_HEIGHT;
+    constexpr float WALK_SPEED = 350.0f;
+    constexpr float RUN_SPEED = 600.0f;
+    constexpr float JUMP_STRENGTH = 700.0f;
+    constexpr float PLATFORM_WIDTH = 170.0f;
+    constexpr float PLATFORM_HEIGHT = 35.0f;
 
-    // game measuments
-    const float LAND_Y = 760.0f;
-    const float GROUND_Y = 840.0f;
+    Entity player(START_X, START_Y, PLAYER_WIDTH, PLAYER_HEIGHT);
+    player.setGravityEnabled(true);
+    player.setGrounded(true);
+    player.setSpriteSheet(
+        CHARACTER_FRAME_COUNT,
+        CHARACTER_FRAME_WIDTH,
+        CHARACTER_FRAME_HEIGHT);
+    player.setAnimationSpeed(8.0f);
 
-    const float GAP_START = 970.0f;
-    const float GAP_END = 1210.0f;
-
-    const float BUNNY_WIDTH = 220.0f;
-    const float BUNNY_HEIGHT = 280.0f;
-
-    const float START_X = 170.0f;
-    const float START_Y = GROUND_Y - BUNNY_HEIGHT;
-
-    const float WALK_SPEED = 350.0f;
-    const float RUN_SPEED = 600.0f;
-    const float JUMP_STRENGTH = 700.0f;
-
-    // Create generic entity
-    Entity bunny(START_X, START_Y, BUNNY_WIDTH, BUNNY_HEIGHT);
-
-    // Controllable entity: player (bunny)
-    bunny.setGravityEnabled(true);
-    bunny.setGrounded(true); // Start on the ground
-    bunny.setSpriteSheet(FRAME_COUNT, FRAME_WIDTH, FRAME_HEIGHT);
-    bunny.setAnimationSpeed(8.0f);
-
-    // Static entity: rock
-    Entity rock(
-        650.0f,
-        GROUND_Y - 140.0f,
-        165.0f,
-        140.0f
-    );
+    Entity rock(650.0f, GROUND_Y - 140.0f, 165.0f, 140.0f);
+    Entity cloud(350.0f, 100.0f, 500.0f, 280.0f);
+    Entity sun(1250.0f, 100.0f, 310.0f, 310.0f);
+    Entity leftLand(0.0f, LAND_Y, GAP_START, 320.0f);
+    Entity rightLand(GAP_END, LAND_Y, WINDOW_WIDTH - GAP_END, 320.0f);
+    Entity tree(1500.0f, GROUND_Y - 360.0f, 300.0f, 360.0f);
+    Entity platform(1010.0f, 590.0f, PLATFORM_WIDTH, PLATFORM_HEIGHT);
 
     rock.setGravityEnabled(false);
-
-    // Automatically moving entity: cloud
-    Entity cloud(
-        350.0f,
-        100.0f,
-        500.0f,
-        280.0f
-    );
-
     cloud.setGravityEnabled(false);
-    cloud.setSpriteSheet(
-        FRAME_COUNT,
-        FRAME_WIDTH,
-        FRAME_HEIGHT
-    );
-    cloud.setAnimationSpeed(4.0f);
-
-    // Decorative animated sun
-    Entity sun(
-        1250.0f,
-        100.0f,
-        310.0f,
-        310.0f
-    );
-
     sun.setGravityEnabled(false);
-    sun.setSpriteSheet(
-        FRAME_COUNT,
-        FRAME_WIDTH,
-        FRAME_HEIGHT
-    );
-    sun.setAnimationSpeed(5.0f);
-
-
-    // Two ground sections create the gap.
-    Entity leftLand(
-        0.0f,
-        LAND_Y,
-        GAP_START,
-        320.0f
-    );
-
-    Entity rightLand(
-        GAP_END,
-        LAND_Y,
-        WINDOW_WIDTH - GAP_END,
-        320.0f
-    );
-
     leftLand.setGravityEnabled(false);
     rightLand.setGravityEnabled(false);
-
-    // Entity: Tree
-    Entity tree(
-        1500.0f,
-        GROUND_Y - 360.0f,
-        300.0f,
-        360.0f
-    );
-
     tree.setGravityEnabled(false);
-    tree.setSpriteSheet(
-        FRAME_COUNT,
-        FRAME_WIDTH,
-        FRAME_HEIGHT
-    );
+    platform.setGravityEnabled(false);
 
+    cloud.setSpriteSheet(4, CLOUD_SUN_FRAME_WIDTH, CLOUD_SUN_FRAME_HEIGHT);
+    cloud.setAnimationSpeed(4.0f);
+    sun.setSpriteSheet(4, CLOUD_SUN_FRAME_WIDTH, CLOUD_SUN_FRAME_HEIGHT);
+    sun.setAnimationSpeed(5.0f);
+    tree.setSpriteSheet(4, TREE_FRAME_WIDTH, TREE_FRAME_HEIGHT);
     tree.setAnimationSpeed(3.0f);
 
+    SDL_Texture* characterTextures[4] = {
+        nullptr,
+        loadTexture(renderer, "../assets/bunny.png"),
+        loadTexture(renderer, "../assets/fox.png"),
+        loadTexture(renderer, "../assets/cat.png")
+    };
 
-    // Load textures
-    SDL_Texture* bunnyTexture =
-        IMG_LoadTexture(renderer, "../assets/bunny.png");
+    SDL_Texture* cloudTexture = loadTexture(renderer, "../assets/cloud.png");
+    SDL_Texture* sunTexture = loadTexture(renderer, "../assets/sun.png");
+    SDL_Texture* landTexture = loadTexture(renderer, "../assets/land.png");
+    SDL_Texture* rockTexture = loadTexture(renderer, "../assets/rock.png");
+    SDL_Texture* treeTexture = loadTexture(renderer, "../assets/tree.png");
 
-    SDL_Texture* cloudTexture =
-        IMG_LoadTexture(renderer, "../assets/cloud.png");
+    player.setTexture(characterTextures[clientID]);
+    cloud.setTexture(cloudTexture);
+    sun.setTexture(sunTexture);
+    leftLand.setTexture(landTexture);
+    rightLand.setTexture(landTexture);
+    platform.setTexture(landTexture); //
+    rock.setTexture(rockTexture);
+    tree.setTexture(treeTexture);
 
-    SDL_Texture* sunTexture =
-        IMG_LoadTexture(renderer, "../assets/sun.png");
+    // These are created once so their animation does not reset every frame
+    Entity remoteBunny(
+        0.0f, 0.0f,
+        PLAYER_WIDTH, PLAYER_HEIGHT
+    );
 
-    SDL_Texture* landTexture =
-        IMG_LoadTexture(renderer, "../assets/land.png");
+    Entity remoteFox(
+        0.0f, 0.0f,
+        PLAYER_WIDTH, PLAYER_HEIGHT
+    );
 
-    SDL_Texture* rockTexture =
-        IMG_LoadTexture(renderer, "../assets/rock.png");
-    
-    SDL_Texture* treeTexture =
-        IMG_LoadTexture(renderer, "../assets/tree.png");
+    Entity remoteCat(
+        0.0f, 0.0f,
+        PLAYER_WIDTH, PLAYER_HEIGHT
+    );
 
+    Entity* remoteEntities[4] = {
+        nullptr,
+        &remoteBunny,
+        &remoteFox,
+        &remoteCat
+    };
 
-    // Check if the texture loaded correctly
-    if (!bunnyTexture) {
-        SDL_Log("Could not load texture: %s", SDL_GetError());
-    }
-    else {
-        bunny.setTexture(bunnyTexture);
-    }
+    bool remoteVisible[4] = {
+        false,
+        false,
+        false,
+        false
+    };
 
-    if (!cloudTexture) {
-        SDL_Log("Could not load cloud texture: %s",SDL_GetError()
+    for (int id = 1; id <= 3; ++id) {
+        remoteEntities[id]->setTexture(characterTextures[id]);
+
+        remoteEntities[id]->setSpriteSheet(
+            CHARACTER_FRAME_COUNT,
+            CHARACTER_FRAME_WIDTH,
+            CHARACTER_FRAME_HEIGHT
         );
-    }
-    else {
-        cloud.setTexture(cloudTexture);
+
+        remoteEntities[id]->setAnimationSpeed(8.0f);
     }
 
-    if (!sunTexture) {
-        SDL_Log("Could not load sun texture: %s", SDL_GetError());
-    }
-    else {
-        sun.setTexture(sunTexture);
+    Physics physics(1000.0f);
+    Timeline gameTime;
+
+    SharedData sharedData;
+    {
+        std::lock_guard<std::mutex> lock(sharedData.stateMutex);
+        sharedData.playerX = player.getX();
+        sharedData.playerY = player.getY();
     }
 
-    if (!landTexture) {
-        SDL_Log("Could not load land texture: %s", SDL_GetError());
-    }
-    else {
-        leftLand.setTexture(landTexture);
-        rightLand.setTexture(landTexture);
-    }
-
-    if (!rockTexture) {
-        SDL_Log("Could not load rock texture: %s", SDL_GetError());
-    }
-    else {
-        rock.setTexture(rockTexture);
-    }
-
-    if (!treeTexture) {
-        SDL_Log("Could not load tree texture: %s", SDL_GetError());
-    }
-    else {
-        tree.setTexture(treeTexture);
-    }
-
-
-    // Physics and game state
-    Physics physics;
-    physics.setGravity(1000.0f); 
-
-    float cloudSpeed = 90.0f;
-    int cloudDirection = 1;
-
-    const float CLOUD_MIN_X = 250.0f;
-    const float CLOUD_MAX_X = 900.0f;
+    std::thread networkThread(networkingThread, std::ref(sharedData), clientID);
 
     bool running = true;
     bool gameOver = false;
+    bool pauseKeyWasPressed = false;
+    bool minusKeyWasPressed = false;
+    bool plusKeyWasPressed = false;
     bool scalingKeyWasPressed = false;
 
+    float cloudSpeed = 90.0f;
+    int cloudDirection = 1;
+    constexpr float CLOUD_MIN_X = 250.0f;
+    constexpr float CLOUD_MAX_X = 900.0f;
+
+    float previousPlatformX = platform.getX();
     SDL_Event event;
-    Uint64 lastTime = SDL_GetTicks();
 
-
-    // Main game loop
     while (running) {
-
-        // Check if user closes window
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT) {
                 running = false;
             }
         }
 
-        Uint64 currentTime = SDL_GetTicks();
-        float deltaTime = (currentTime - lastTime) / 1000.0f;
-        lastTime = currentTime;
-
-        // Prevent large movements after pausing or dragging window.
-        if (deltaTime > 0.05f) {
-            deltaTime = 0.05f;
+        bool pausePressed = Input::isKeyPressed(SDL_SCANCODE_P);
+        if (pausePressed && !pauseKeyWasPressed) {
+            if (gameTime.isPaused()) {
+                gameTime.unpause();
+                SDL_Log("Game resumed");
+            }
+            else {
+                gameTime.pause();
+                SDL_Log("Game paused");
+            }
         }
+        pauseKeyWasPressed = pausePressed;
 
-        // Toggle scaling with T
-        bool scalingKeyIsPressed =
-            Input::isKeyPressed(SDL_SCANCODE_T);
+        bool minusPressed = Input::isKeyPressed(SDL_SCANCODE_MINUS);
+        if (minusPressed && !minusKeyWasPressed) {
+            if (gameTime.getScale() == 2.0) gameTime.setScale(1.0);
+            else if (gameTime.getScale() == 1.0) gameTime.setScale(0.5);
+            SDL_Log("Timeline scale: %.1fx", gameTime.getScale());
+        }
+        minusKeyWasPressed = minusPressed;
 
-        if (scalingKeyIsPressed && !scalingKeyWasPressed) {
+        bool plusPressed = Input::isKeyPressed(SDL_SCANCODE_EQUALS);
+        if (plusPressed && !plusKeyWasPressed) {
+            if (gameTime.getScale() == 0.5) gameTime.setScale(1.0);
+            else if (gameTime.getScale() == 1.0) gameTime.setScale(2.0);
+            SDL_Log("Timeline scale: %.1fx", gameTime.getScale());
+        }
+        plusKeyWasPressed = plusPressed;
+        sharedData.timeScale.store(gameTime.getScale());
+
+        bool scalingPressed = Input::isKeyPressed(SDL_SCANCODE_T);
+        if (scalingPressed && !scalingKeyWasPressed) {
             Scaling::toggleMode();
-
             SDL_Log(
                 "Scaling mode: %s",
                 Scaling::getMode() == ScalingMode::PROPORTIONAL
-                    ? "PROPORTIONAL"
-                    : "PIXEL"
-            );
+                    ? "PROPORTIONAL" : "PIXEL");
         }
+        scalingKeyWasPressed = scalingPressed;
 
-        scalingKeyWasPressed = scalingKeyIsPressed;
+        float deltaTime = static_cast<float>(gameTime.getDeltaTime());
+        if (deltaTime > 0.05f) deltaTime = 0.05f;
 
-        // Restart after falling to the gap by pressing R.
         if (gameOver && Input::isKeyPressed(SDL_SCANCODE_R)) {
-            bunny.setPosition(START_X, START_Y);
-            bunny.setVelocity(0.0f, 0.0f);
-            bunny.setGrounded(true);
+            player.setPosition(START_X, START_Y);
+            player.setVelocity(0.0f, 0.0f);
+            player.setGrounded(true);
             gameOver = false;
-
-            SDL_Log("Game restarted!");
         }
 
-        // A: walk left
-        // D: walk right
-        // W: jump
-        // W + A: jump left
-        // W + D: jump right
-        // Shift + A: run left
-        // Shift + D: run right
-
-        if (!gameOver) {
-            float previousX = bunny.getX();
-            // Walk normally and run while either Shift key is held.
+        if (!gameOver && !gameTime.isPaused()) {
+            float previousX = player.getX();
             float moveSpeed = WALK_SPEED;
-
-            // Shift key held down increases speed to run
-            if (Input::isKeyPressed(SDL_SCANCODE_LSHIFT) || Input::isKeyPressed(SDL_SCANCODE_RSHIFT)) {
+            if (Input::isKeyPressed(SDL_SCANCODE_LSHIFT) ||
+                Input::isKeyPressed(SDL_SCANCODE_RSHIFT)) {
                 moveSpeed = RUN_SPEED;
             }
 
-            // A moves left
             if (Input::isKeyPressed(SDL_SCANCODE_A)) {
-                bunny.move(-moveSpeed * deltaTime, 0.0f);
+                player.move(-moveSpeed * deltaTime, 0.0f);
             }
-
-            // D moves right
             if (Input::isKeyPressed(SDL_SCANCODE_D)) {
-                bunny.move(moveSpeed * deltaTime, 0.0f);
+                player.move(moveSpeed * deltaTime, 0.0f);
             }
-
-            // W jumps
             if (Input::isKeyPressed(SDL_SCANCODE_W)) {
-                physics.jump(bunny, JUMP_STRENGTH);
+                physics.jump(player, JUMP_STRENGTH);
             }
 
-            // Keep the bunny inside the left and right boundaries.
-            if (bunny.getX() < 0.0f) {
-                bunny.setPosition(0.0f, bunny.getY());
+            if (player.getX() < 0.0f) {
+                player.setPosition(0.0f, player.getY());
+            }
+            if (player.getX() + player.getWidth() > WINDOW_WIDTH) {
+                player.setPosition(WINDOW_WIDTH - player.getWidth(), player.getY());
             }
 
-            if (bunny.getX() + bunny.getWidth() > WINDOW_WIDTH) {
-                bunny.setPosition(
-                    WINDOW_WIDTH - bunny.getWidth(),
-                    bunny.getY()
-                );
-            }
+            physics.update(player, deltaTime);
 
-            physics.update(bunny, deltaTime);
+            float centerX = player.getX() + player.getWidth() / 2.0f;
+            float bottom = player.getY() + player.getHeight();
+            bool overGap = centerX > GAP_START && centerX < GAP_END;
 
-
-            // Ground and gap detection
-            float bunnyLeft = bunny.getX();
-            float bunnyRight =
-                bunny.getX() + bunny.getWidth();
-            float bunnyBottom =
-                bunny.getY() + bunny.getHeight();
-
-            // Bunny is completely inside the gap when it has
-            // moved past the left platform and has not reached
-            // the right platform.
-            float bunnyCenterX =
-                bunny.getX() + bunny.getWidth() / 2.0f;
-
-            bool overGap =
-                bunnyCenterX > GAP_START &&
-                bunnyCenterX < GAP_END;
-
-            if (!overGap &&
-                bunnyBottom >= GROUND_Y &&
-                bunny.getVelocityY() >= 0.0f) {
-
-                bunny.setPosition(
-                    bunny.getX(),
-                    GROUND_Y - bunny.getHeight()
-                );
-
-                bunny.setVelocityY(0.0f);
-                bunny.setGrounded(true);
+            if (!overGap && bottom >= GROUND_Y &&
+                player.getVelocityY() >= 0.0f) {
+                player.setPosition(player.getX(), GROUND_Y - player.getHeight());
+                player.setVelocityY(0.0f);
+                player.setGrounded(true);
             }
             else {
-                bunny.setGrounded(false);
+                player.setGrounded(false);
             }
 
-            // Collision response: rock blocks the bunny
-            if (Collision::checkCollision(bunny, rock)) {
-                bunny.setPosition(previousX, bunny.getY());
+            if (Collision::checkCollision(player, rock)) {
+                player.setPosition(previousX, player.getY());
             }
 
-
-            // Falling into the gap causes game over
-            if (bunny.getY() > WINDOW_HEIGHT) {
+            if (player.getY() > WINDOW_HEIGHT) {
                 gameOver = true;
-                bunny.setVelocity(0.0f, 0.0f);
-
-                SDL_Log(
-                    "GAME OVER! Press R to restart."
-                );
+                player.setVelocity(0.0f, 0.0f);
+                SDL_Log("GAME OVER! Press R to restart.");
             }
         }
 
-        // Automatically move the cloud
-        cloud.move(
-            cloudSpeed * cloudDirection * deltaTime,
-            0.0f
-        );
-
-        if (cloud.getX() >= CLOUD_MAX_X) {
-            cloud.setPosition(CLOUD_MAX_X, cloud.getY());
-            cloudDirection = -1;
-        }
-        else if (cloud.getX() <= CLOUD_MIN_X) {
-            cloud.setPosition(CLOUD_MIN_X, cloud.getY());
-            cloudDirection = 1;
+        // Read the server-authoritative platform position
+        float serverPlatformX = platform.getX();
+        float serverPlatformY = platform.getY();
+        {
+            std::lock_guard<std::mutex> lock(sharedData.stateMutex);
+            serverPlatformX = sharedData.platformX;
+            serverPlatformY = sharedData.platformY;
         }
 
+        float platformDeltaX = serverPlatformX - previousPlatformX;
+        platform.setPosition(serverPlatformX, serverPlatformY);
+        previousPlatformX = serverPlatformX;
 
-        // Update sprite animations
-        bunny.updateAnimation(deltaTime);
-        cloud.updateAnimation(deltaTime);
-        sun.updateAnimation(deltaTime);
-        tree.updateAnimation(deltaTime);
+        float playerLeft = player.getX();
+        float playerRight = player.getX() + player.getWidth();
+        float playerBottom = player.getY() + player.getHeight();
+        bool overPlatform =
+            playerRight > platform.getX() &&
+            playerLeft < platform.getX() + platform.getWidth();
+        bool landingOnPlatform =
+            playerBottom >= platform.getY() - 20.0f &&
+            playerBottom <= platform.getY() + 20.0f &&
+            player.getVelocityY() >= 0.0f;
 
+        if (!gameOver && overPlatform && landingOnPlatform) {
+            player.setPosition(
+                player.getX() + platformDeltaX,
+                platform.getY() - player.getHeight());
+            player.setVelocityY(0.0f);
+            player.setGrounded(true);
+        }
 
-        // Pink and White ombre gradient background
-        const int BACKGROUND_BANDS = 40;
-        const float BAND_HEIGHT =
-            static_cast<float>(WINDOW_HEIGHT) /
-            BACKGROUND_BANDS;
+        // Reset visibility before reading the newest network information
+        for (int id = 1; id <= 3; ++id) {
+            remoteVisible[id] = false;
+        }
 
-        for (int i = 0; i < BACKGROUND_BANDS; i++) {
-            float amount =
-                static_cast<float>(i) /
-                static_cast<float>(BACKGROUND_BANDS - 1);
-
-            Uint8 red = 255;
-            Uint8 green =
-                static_cast<Uint8>(250.0f - 55.0f * amount);
-            Uint8 blue =
-                static_cast<Uint8>(252.0f - 35.0f * amount);
-
-            SDL_SetRenderDrawColor(
-                renderer,
-                red,
-                green,
-                blue,
-                255
+        {
+            std::lock_guard<std::mutex> lock(
+                sharedData.stateMutex
             );
 
+            for (const auto& entry : sharedData.remotePlayers) {
+                int remoteID = entry.first;
+
+                if (remoteID < 1 || remoteID > 3) {
+                    continue;
+                }
+
+                if (remoteID == clientID) {
+                    continue;
+                }
+
+                const RemotePlayerState& remote = entry.second;
+
+                remoteEntities[remoteID]->setPosition(
+                    remote.x,
+                    remote.y
+                );
+
+                remoteVisible[remoteID] = true;
+            }
+        }
+
+        if (!gameTime.isPaused()) {
+            cloud.move(cloudSpeed * cloudDirection * deltaTime, 0.0f);
+            if (cloud.getX() >= CLOUD_MAX_X) {
+                cloud.setPosition(CLOUD_MAX_X, cloud.getY());
+                cloudDirection = -1;
+            }
+            else if (cloud.getX() <= CLOUD_MIN_X) {
+                cloud.setPosition(CLOUD_MIN_X, cloud.getY());
+                cloudDirection = 1;
+            }
+
+            player.updateAnimation(deltaTime);
+            cloud.updateAnimation(deltaTime);
+            sun.updateAnimation(deltaTime);
+            tree.updateAnimation(deltaTime);
+
+            // Animate remote characters even when they are standing still
+            for (int id = 1; id <= 3; ++id) {
+                if (id != clientID &&
+                    remoteVisible[id] &&
+                    remoteEntities[id] != nullptr) {
+                    remoteEntities[id]->updateAnimation(deltaTime);
+                }
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(sharedData.stateMutex);
+            sharedData.playerX = player.getX();
+            sharedData.playerY = player.getY();
+        }
+
+        // Pink and white ombre background
+        constexpr int BACKGROUND_BANDS = 40;
+        constexpr float BAND_HEIGHT =
+            static_cast<float>(WINDOW_HEIGHT) / BACKGROUND_BANDS;
+
+        for (int i = 0; i < BACKGROUND_BANDS; ++i) {
+            float amount = static_cast<float>(i) /
+                           static_cast<float>(BACKGROUND_BANDS - 1);
+            SDL_SetRenderDrawColor(
+                renderer,
+                255,
+                static_cast<Uint8>(250.0f - 55.0f * amount),
+                static_cast<Uint8>(252.0f - 35.0f * amount),
+                255);
             SDL_FRect band = {
                 0.0f,
                 i * BAND_HEIGHT,
                 static_cast<float>(WINDOW_WIDTH),
                 BAND_HEIGHT + 1.0f
             };
-
             SDL_RenderFillRect(renderer, &band);
         }
 
-        // Render the game scene
         cloud.render(renderer);
         sun.render(renderer);
-
         leftLand.render(renderer);
         rightLand.render(renderer);
         tree.render(renderer);
         rock.render(renderer);
+        platform.render(renderer);
 
-        if (!gameOver) {
-            bunny.render(renderer);
+        // Render the persistent remote entities.
+        for (int id = 1; id <= 3; ++id) {
+            if (id != clientID &&
+                remoteVisible[id] &&
+                remoteEntities[id] != nullptr) {
+                remoteEntities[id]->render(renderer);
+            }
         }
 
-        // Pink overlay when the game is over.
+        if (!gameOver) {
+            player.render(renderer);
+        }
+
         if (gameOver) {
-            SDL_SetRenderDrawBlendMode(
-                renderer,
-                SDL_BLENDMODE_BLEND
-            );
-
-            SDL_SetRenderDrawColor(
-                renderer,
-                255,
-                180,
-                205,
-                110
-            );
-
+            SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(renderer, 255, 180, 205, 110);
             SDL_FRect overlay = {
-                0.0f,
-                0.0f,
+                0.0f, 0.0f,
                 static_cast<float>(WINDOW_WIDTH),
                 static_cast<float>(WINDOW_HEIGHT)
             };
-
             SDL_RenderFillRect(renderer, &overlay);
         }
 
         SDL_RenderPresent(renderer);
     }
 
+    sharedData.running.store(false);
+    if (networkThread.joinable()) {
+        networkThread.join();
+    }
 
-    // Clean up
-    SDL_DestroyTexture(bunnyTexture);
-    SDL_DestroyTexture(cloudTexture);
-    SDL_DestroyTexture(sunTexture);
-    SDL_DestroyTexture(landTexture);
-    SDL_DestroyTexture(rockTexture);
-    SDL_DestroyTexture(treeTexture);
+    for (int id = 1; id <= 3; ++id) {
+        if (characterTextures[id]) SDL_DestroyTexture(characterTextures[id]);
+    }
+    if (cloudTexture) SDL_DestroyTexture(cloudTexture);
+    if (sunTexture) SDL_DestroyTexture(sunTexture);
+    if (landTexture) SDL_DestroyTexture(landTexture);
+    if (rockTexture) SDL_DestroyTexture(rockTexture);
+    if (treeTexture) SDL_DestroyTexture(treeTexture);
 
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();
-
     return 0;
 }
