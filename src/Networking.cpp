@@ -1,158 +1,198 @@
 #include "Networking.h"
 
 #include <zmq.hpp>
-
-#include <chrono>
-#include <iostream>
 #include <sstream>
 #include <string>
+#include <chrono>
 #include <thread>
+#include <iostream>
+#include <cstring>
+#include <vector>
 
-namespace {
-constexpr int SERVER_BASE_PORT = 5555;
-constexpr int PEER_BASE_PORT = 6000;
-constexpr int TOTAL_CLIENTS = 3;
+// Section 5: Ports used for direct peer-to-peer communication.
+#define PEER_BASE_PORT 6000
+#define TOTAL_PEERS 4
 
-void receivePeerPositions(zmq::socket_t& subscriber,
-                          SharedData& sharedData,
-                          int clientID)
-{
-    while (true) {
-        zmq::message_t message;
-        auto result = subscriber.recv(message, zmq::recv_flags::dontwait);
-        if (!result) {
-            break;
-        }
-
-        std::string text(static_cast<char*>(message.data()), message.size());
-        std::istringstream input(text);
-        int remoteID = 0;
-        float remoteX = 0.0f;
-        float remoteY = 0.0f;
-
-        if (input >> remoteID >> remoteX >> remoteY &&
-            remoteID >= 1 && remoteID <= TOTAL_CLIENTS &&
-            remoteID != clientID) {
-            std::lock_guard<std::mutex> lock(sharedData.stateMutex);
-            sharedData.remotePlayers[remoteID] = {remoteX, remoteY};
-        }
-    }
-}
-
-void receiveServerPlatform(const std::string& reply, SharedData& sharedData)
-{
-    std::istringstream entries(reply);
-    std::string entry;
-
-    while (std::getline(entries, entry, ';')) {
-        if (entry.empty()) {
-            continue;
-        }
-
-        std::istringstream values(entry);
-        int objectID = -1;
-        float x = 0.0f;
-        float y = 0.0f;
-
-        if (values >> objectID >> x >> y && objectID == 0) {
-            std::lock_guard<std::mutex> lock(sharedData.stateMutex);
-            sharedData.platformX = x;
-            sharedData.platformY = y;
-            sharedData.platformConnected = true;
-        }
-    }
-}
-} // namespace
-
-void networkingThread(SharedData& sharedData, int clientID)
-{
+void networkingThread(
+    SharedData& sharedData,
+    int clientID
+) {
     try {
         zmq::context_t context(1);
 
-        // Hybrid Section 5 design: player positions travel directly peer-to-peer.
-        zmq::socket_t publisher(context, zmq::socket_type::pub);
-        publisher.set(zmq::sockopt::linger, 0);
-        publisher.bind("tcp://*:" + std::to_string(PEER_BASE_PORT + clientID));
+        // Section 5: This socket sends this player's position to the other clients.
+        zmq::socket_t peerPublisher(context, zmq::socket_type::pub);
+        peerPublisher.set(zmq::sockopt::linger,0);
 
-        zmq::socket_t subscriber(context, zmq::socket_type::sub);
-        subscriber.set(zmq::sockopt::linger, 0);
-        subscriber.set(zmq::sockopt::subscribe, "");
+        // Section 5: Each client has its own peer port. Client 1 -> 6001, Client 2 -> 6002, and Client 3 -> 6003, Client 4 -> 6004
+        int peerPort = PEER_BASE_PORT + clientID;
+        std::string peerAddress = "tcp://*:" + std::to_string(peerPort);
+        peerPublisher.bind(peerAddress);
 
-        for (int peerID = 1; peerID <= TOTAL_CLIENTS; ++peerID) {
-            if (peerID != clientID) {
-                subscriber.connect(
-                    "tcp://localhost:" +
-                    std::to_string(PEER_BASE_PORT + peerID));
-            }
+        // This socket receives positions from the other clients.
+        zmq::socket_t peerSubscriber(context, zmq::socket_type::sub);
+        peerSubscriber.set(zmq::sockopt::linger,0);
+        // Receive every peer message.
+        peerSubscriber.set(zmq::sockopt::subscribe,"");
+
+        // Section 5: Connect to the other clients.
+        for (int peerID = 1; peerID <= TOTAL_PEERS; peerID++) {
+            if (peerID == clientID) { continue; } // skip connecting to self
+        
+            int otherPeerPort = PEER_BASE_PORT + peerID;
+            std::string otherPeerAddress = "tcp://localhost:" + std::to_string(otherPeerPort);
+            peerSubscriber.connect(otherPeerAddress);
         }
 
-        // Section 4: each client has its own synchronous server connection.
-        // The server dedicates one REP socket/thread to every client.
-        zmq::socket_t serverRequest(context, zmq::socket_type::req);
-        serverRequest.set(zmq::sockopt::linger, 0);
-        serverRequest.set(zmq::sockopt::req_relaxed, 1);
-        serverRequest.set(zmq::sockopt::req_correlate, 1);
-        serverRequest.set(zmq::sockopt::rcvtimeo, 100);
-        serverRequest.set(zmq::sockopt::sndtimeo, 100);
-        serverRequest.connect(
-            "tcp://localhost:" +
-            std::to_string(SERVER_BASE_PORT + clientID));
+        // Allow ZeroMQ time to establish P2P subscriptions across peers
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        std::cout << "Client " << clientID
-                  << " networking thread started" << std::endl;
+        std::cout << "Peer " << clientID << " P2P networking thread started on port " << peerPort
+                  << " (data format: " << NetFormat::formatName(sharedData.networkFormat) << ")" << std::endl;
 
         while (sharedData.running.load()) {
-            float localX = 0.0f;
-            float localY = 0.0f;
+
+            float localX;
+            float localY;
+
+            /*
+             * Safely read the local player's
+             * latest position.
+             */
             {
-                std::lock_guard<std::mutex> lock(sharedData.stateMutex);
+                std::lock_guard<std::mutex> lock(sharedData.playerMutex);
+
                 localX = sharedData.playerX;
                 localY = sharedData.playerY;
             }
 
-            std::ostringstream position;
-            position << clientID << ' ' << localX << ' ' << localY;
-            const std::string message = position.str();
+            // Section C.2-C.4: copy the extra moving objects (empty in the normal game).
+            std::vector<ObjectState> localObjects;
+            {
+                std::lock_guard<std::mutex> lock(sharedData.playerMutex);
+                localObjects = sharedData.localObjects;
+            }
 
-            publisher.send(zmq::buffer(message), zmq::send_flags::none);
-            receivePeerPositions(subscriber, sharedData, clientID);
+            // Section 5: Send this player's position directly to the other clients.
+            // The server does not relay this data.
+            // Section C.1: encode() builds either the TEXT string or the BINARY
+            // struct, depending on the format chosen when the client was started.
+            const auto encodeStart = std::chrono::steady_clock::now();
+            std::string peerString = NetFormat::encode(sharedData.networkFormat, clientID, localX, localY);
+            std::string objectString;
+            if (!localObjects.empty()) {
+                objectString = NetFormat::encodeObjects(sharedData.networkFormat, clientID, localObjects);
+            }
+            const auto encodeEnd = std::chrono::steady_clock::now();
 
-            // Send a synchronous request only when the socket is ready.
-            // After a successful send, receive the server-authoritative platform.
-            auto sent = serverRequest.send(
-                zmq::buffer(message),
-                zmq::send_flags::dontwait);
+            peerPublisher.send(zmq::buffer(peerString), zmq::send_flags::none);
+            if (!objectString.empty()) {
+                peerPublisher.send(zmq::buffer(objectString), zmq::send_flags::none);
+            }
 
-            if (sent) {
-                zmq::message_t reply;
-                auto received = serverRequest.recv(reply, zmq::recv_flags::none);
-                if (received) {
-                    receiveServerPlatform(
-                        std::string(static_cast<char*>(reply.data()), reply.size()),
-                        sharedData);
+            // Section C.2-C.4: Record how much work this send round took.
+            sharedData.stats.ticks++;
+            sharedData.stats.bytesSent += peerString.size() + objectString.size();
+            sharedData.stats.encodeNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(encodeEnd - encodeStart).count();
+
+            // Section 5: Non-blocking loop to receive messages from all other peers
+            while (true) {
+                zmq::message_t peerMessage;
+
+                // Prevents this client from getting stuck waiting for another client.
+                auto peerResult = peerSubscriber.recv(peerMessage, zmq::recv_flags::dontwait);
+
+                // No more pending messages from peers
+                if (!peerResult) { break; }
+
+                int remoteID;
+                float remoteX;
+                float remoteY;
+
+                // Section C.2-C.4: Object snapshots (benchmark only) are stored separately.
+                if (NetFormat::isObjectMessage(peerMessage.data(), peerMessage.size())) {
+                    std::vector<ObjectState> remoteObjectList;
+                    const auto decodeStart = std::chrono::steady_clock::now();
+                    const bool decoded = NetFormat::decodeObjects(peerMessage.data(), peerMessage.size(), remoteID, remoteObjectList);
+                    sharedData.stats.decodeNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - decodeStart).count();
+                    sharedData.stats.messagesReceived++;
+
+                    if (decoded && remoteID != clientID && remoteID >= 1 && remoteID <= TOTAL_PEERS) {
+                        std::lock_guard<std::mutex> lock(sharedData.playerMutex);
+                        sharedData.remoteObjects[remoteID] = std::move(remoteObjectList);
+                    }
+                    continue; // done with this message, check for the next one
+                }
+
+                // Section C.1: decode() detects TEXT vs BINARY from the message itself.
+                const auto decodeStart = std::chrono::steady_clock::now();
+                const bool playerDecoded = NetFormat::decode(peerMessage.data(), peerMessage.size(), remoteID, remoteX, remoteY);
+                sharedData.stats.decodeNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - decodeStart).count();
+                sharedData.stats.messagesReceived++;
+
+                if (playerDecoded) {
+                    if (remoteID != clientID) {
+                        // Thread-safe update of remote player position map
+                        std::lock_guard<std::mutex> lock(sharedData.playerMutex);
+                        if (remoteID >= 1 && remoteID <= TOTAL_PEERS) {
+                            sharedData.remotePlayers[remoteID] = {remoteX, remoteY, std::chrono::steady_clock::now()};
+                        }
+                    }
+                }
+            }
+
+            /*
+             * Section 4: Asynchronicity
+             *
+             * The communication rate for this
+             * client depends on its own Timeline
+             * scale.
+             *
+             * 0.5x -> about 32 ms
+             * 1.0x -> about 16 ms
+             * 2.0x -> about 8 ms
+             *
+             * Each client has a dedicated server
+             * communication thread, so changing
+             * one client's rate does not slow
+             * down or speed up the others.
+             */
+            // PUB/SUB does not report peer disconnects. Expire stale players.
+            {
+                std::lock_guard<std::mutex> lock(sharedData.playerMutex);
+                const auto now = std::chrono::steady_clock::now();
+                for (auto it = sharedData.remotePlayers.begin(); it != sharedData.remotePlayers.end();) {
+                    if (now - it->second.lastSeen > std::chrono::seconds(2)) {
+                        std::cout << "Peer " << it->first << " disconnected (timeout)" << std::endl;
+                        sharedData.remoteObjects.erase(it->first);  // Section C.2-C.4
+                        it = sharedData.remotePlayers.erase(it);
+                    } else {
+                        ++it;
+                    }
                 }
             }
 
             double scale = sharedData.timeScale.load();
-            if (scale <= 0.0) {
-                scale = 1.0;
-            }
 
-            const int delayMs = static_cast<int>(16.0 / scale);
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(delayMs));
+            int sleepMilliseconds = static_cast<int>(16.0 / (scale > 0.0 ? scale : 1.0));
+
+            if (sharedData.networkTickMicros > 0) {
+                // Section C.2-C.4: The benchmark uses a faster fixed tick so the cost of
+                // each data format is easy to measure. The game leaves this at 0.
+                std::this_thread::sleep_for(std::chrono::microseconds(sharedData.networkTickMicros));
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(sleepMilliseconds));
+            }
         }
 
-        serverRequest.close();
-        subscriber.close();
-        publisher.close();
+        // Clean resource shutdown
+        peerPublisher.close();
+        peerSubscriber.close();
         context.close();
     }
-    catch (const zmq::error_t& error) {
+    catch (const zmq::error_t& e) {
         if (sharedData.running.load()) {
-            std::cerr << "Networking error for client " << clientID
-                      << ": " << error.what() << std::endl;
+            std::cerr << "Networking error for client " << clientID << ": " << e.what() << std::endl;
         }
     }
 }

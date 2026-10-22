@@ -1,30 +1,62 @@
 #pragma once
 
-#include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <vector>
 
+// Milestone 3 Section C.1: which data format this client sends (TEXT or BINARY)
+#include "NetworkFormat.h"
+
+// Structure holding location data for remote peers
 struct RemotePlayerState {
-    float x = 0.0f;
-    float y = 0.0f;
+    float x;
+    float y;
+        std::chrono::steady_clock::time_point lastSeen = std::chrono::steady_clock::now();
 };
 
 struct SharedData {
+    // Controls when worker threads should stop
     std::atomic<bool> running{true};
-    std::atomic<double> timeScale{1.0};
 
-    // Local player state written by the game thread and read by networking.
+    // Milestone 3 Section C.1: Data format used for player positions
+    NetworkFormat networkFormat = NetworkFormat::TEXT;
+
+    /* Milestone 3 Sections C.2-C.4 (performance experiments)*/
+    // Used by the benchmark program; empty during normal gameplay
+    // Local client's moving object positions
+    std::vector<ObjectState> localObjects;
+
+    // Latest object snapshot received from each peer (key = peer ID)
+    std::unordered_map<int, std::vector<ObjectState>> remoteObjects;
+
+    // Fixed network tick in microseconds (0 = original pacing (about 16 ms))
+    int networkTickMicros = 0;
+
+    // Network performance counters for benchmarking
+    struct NetStats {
+        std::atomic<uint64_t> ticks{0}; // total send rounds
+        std::atomic<uint64_t> bytesSent{0}; // total payload bytes sent
+        std::atomic<uint64_t> encodeNanos{0}; // time spent building messages
+        std::atomic<uint64_t> messagesReceived{0};// messages decoded
+        std::atomic<uint64_t> decodeNanos{0}; // time spent parsing messages
+    } stats;
+
+    // Local player's latest position
     float playerX = 0.0f;
     float playerY = 0.0f;
 
-    // Remote player states received directly from peers.
+    // Current timeline/game speed for this client
+    // 0.5 = half speed
+    // 1.0 = normal speed
+    // 2.0 = double speed
+    std::atomic<double> timeScale{1.0};
+
+    // Positions received from the server
     std::unordered_map<int, RemotePlayerState> remotePlayers;
 
-    // Shared platform state received from the authoritative server.
-    float platformX = 1010.0f;
-    float platformY = 650.0f;
-    bool platformConnected = false;
-
-    // Protects all non-atomic state shared by the game and network threads.
-    std::mutex stateMutex;
+    // Protect player positions shared between threads
+    std::mutex playerMutex;
 };
