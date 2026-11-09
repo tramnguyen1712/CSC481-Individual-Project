@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "Collision.h"
+#include "EventManager.h"
 #include "GameObjectFactory.h"
 #include "GameObjectOps.h"
 #include "Input.h"
@@ -104,7 +105,7 @@ const char* characterName(int clientID)
 int main(int argc, char* argv[])
 {
     if (argc < 2) {
-        SDL_Log("Usage: ./main <clientID 1-4>");
+        SDL_Log("Usage: ./main <clientID 1-4> [text|binary] [--offline]");
         return 1;
     }
 
@@ -273,14 +274,13 @@ int main(int argc, char* argv[])
 
     Physics physics(1000.0f);
     Timeline gameTime;
+    Timeline eventClock; // Unscaled, monotonic timestamps even when gameplay pauses.
+    EventManager events;
 
     SharedData sharedData;
     sharedData.networkFormat = networkFormat;
-    {
-        std::lock_guard<std::mutex> lock(sharedData.playerMutex);
-        sharedData.playerX = go::getX(player);
-        sharedData.playerY = go::getY(player);
-    }
+    sharedData.eventManager = &events;
+    events.setNetworkSink([&](const GameEvent& e) { sharedData.queueOutgoingEvent(e); });
 
     std::thread networkThread;
 
@@ -336,27 +336,139 @@ int main(int argc, char* argv[])
     deathZone.getComponent<CollidableComponent>()->solid = false;
     deathZone.addComponent<DeathZoneComponent>();
 
+    // The bomb patrols the second island, away from spawn points and ledges.
+    // Its fuse and transparent sprite margins are outside the lethal body.
+    SDL_Texture* bombTexture = loadTexture(renderer, "../assets/bomb.png");
+    GameObject bomb = makeSceneObject("bomb", 2200, GROUND_Y - 174, 135, 180);
+    go::setTexture(bomb, bombTexture);
+    go::setSpriteSheet(bomb, 4, 512, 682);
+    setAnimationSpeed(bomb, 8);
+    GameObject bombBody = makeSceneObject("bomb-body", 2222, GROUND_Y - 110,
+                                         99, 110, false, true);
+    bombBody.getComponent<CollidableComponent>()->solid = false;
+
     float cameraX = 0;
     GameObject* standingOn = nullptr;
-    auto respawnPlayer = [&]() {
+    bool jumpKeyWasPressed = false;
+    bool restartKeyWasPressed = false;
+    bool cheerKeyWasPressed = false;
+    bool debugKeyWasPressed = false;
+    bool showHiddenObjects = false;
+
+    // The Milestone 4 team manager orders events by priority, timestamp and
+    // insertion order. These handlers run on the main thread, including those
+    // raised by the networking worker.
+    float horizontalSpeed = 0.0f;
+    int boostFrom = 0;
+    std::string status = "Q: cheer for teammates";
+    std::string displayedTitle;
+    using Clock = std::chrono::steady_clock;
+    auto nextCheer = Clock::now();
+
+    events.subscribe(EventType::Spawn, [&](const GameEvent& e) {
+        if (e.sourceId != clientID || e.targetId != clientID) return;
         const GameObject& spawn = spawnPoints.at(clientID - 1);
         go::setPosition(player, go::getX(spawn), go::getY(spawn));
         go::setVelocity(player, 0, 0);
         go::setGrounded(player, true);
         standingOn = &ground1;
         cameraX = 0;
-    };
-    respawnPlayer();
+        boostFrom = 0;
+        status = e.detail == "bomb" ? "Hit by bomb | Respawned" :
+                 e.detail == "death-zone" ? "Respawned after fall" : "At spawn | Q: cheer";
+        SDL_Log("[Spawn] %s returned to spawn %d (%s)", characterName(clientID), clientID, e.detail.c_str());
+    });
+
+    events.subscribe(EventType::Death, [&](const GameEvent& e) {
+        if (e.sourceId != clientID || e.targetId != clientID ||
+            (e.detail != "death-zone" && e.detail != "bomb")) return;
+        SDL_Log("[Death] %s %s", characterName(clientID),
+                e.detail == "bomb" ? "was hit by the bomb" : "fell into the death zone");
+        events.raise({EventType::Spawn, EventPriority::Critical, eventClock.getTime(),
+                      clientID, clientID, e.detail});
+    });
+
+    events.subscribe(EventType::Collision, [&](const GameEvent& e) {
+        if (e.sourceId != clientID) return;
+        if (e.detail == "death-zone" || e.detail == "bomb") {
+            if (e.targetId != clientID) return;
+            SDL_Log("[Collision] %s touched %s", characterName(clientID),
+                    e.detail == "bomb" ? "the bomb" : "the death zone");
+            events.raise({EventType::Death, EventPriority::Critical, eventClock.getTime(),
+                          clientID, clientID, e.detail});
+        } else if (e.detail == "side") {
+            go::setPosition(player, e.x, go::getY(player));
+        } else if (e.detail == "ceiling") {
+            go::setPosition(player, go::getX(player), e.y);
+            go::setVelocityY(player, 0);
+        } else if (e.detail == "land" && e.targetId >= 0 &&
+                   static_cast<std::size_t>(e.targetId) < solidObjects.size()) {
+            if (showHiddenObjects && standingOn != solidObjects[e.targetId])
+                SDL_Log("[Collision] %s landed on %s", characterName(clientID),
+                        solidObjects[e.targetId]->getType().c_str());
+            go::setPosition(player, go::getX(player), e.y - PLAYER_HEIGHT);
+            go::setVelocityY(player, 0);
+            go::setGrounded(player, true);
+            standingOn = solidObjects[e.targetId];
+        }
+    });
+
+    events.subscribe(EventType::Input, [&](const GameEvent& e) {
+        // A cheer is the only remote command that changes local gameplay.
+        // The source receives its own event too, but cannot boost itself.
+        if (e.detail == "bunny.cheer") {
+            if (e.sourceId == clientID || e.sourceId < 1 || e.sourceId > 4 || e.targetId != 0) return;
+            boostFrom = e.sourceId; // One charge; repeated cheers do not stack.
+            status = std::string("Boost ready from ") + characterName(boostFrom) + " | W or Space";
+            SDL_Log("[Network Input] Cheer from %s: next grounded jump boosted", characterName(boostFrom));
+            return;
+        }
+        if (e.sourceId != clientID || e.targetId != clientID) return;
+        if (e.detail == "move") {
+            horizontalSpeed = e.x;
+        } else if (e.detail == "jump" && !gameTime.isPaused() &&
+                   player.getComponent<GravityComponent>()->grounded) {
+            physics.jump(player, boostFrom ? JUMP_STRENGTH * 1.30f : JUMP_STRENGTH);
+            standingOn = nullptr;
+            SDL_Log("[Input] %s jumped%s", characterName(clientID), boostFrom ? " with a cheer boost" : "");
+            if (boostFrom) status = "Boost used | Q: cheer";
+            boostFrom = 0;
+        } else if (e.detail == "restart") {
+            events.raise({EventType::Spawn, EventPriority::High, eventClock.getTime(),
+                          clientID, clientID, "manual restart"});
+        } else if (e.detail == "cheer") {
+            if (offline) {
+                status = "Cheer needs online mode";
+                return;
+            }
+            // PUB/SUB is best effort. Check that a peer has been seen before
+            // inviting the player to try the boost with a second window.
+            {
+                std::lock_guard<std::mutex> lock(sharedData.playerMutex);
+                if (sharedData.remotePlayers.empty()) {
+                    status = "Open a second client to cheer";
+                    return;
+                }
+            }
+            const auto now = Clock::now();
+            if (now < nextCheer) return;
+            nextCheer = now + std::chrono::seconds(2);
+            events.raiseNetworked({EventType::Input, EventPriority::High, eventClock.getTime(),
+                                   clientID, 0, "bunny.cheer"});
+            if (!boostFrom) status = "Cheer sent | Watch the other client";
+            SDL_Log("[Network Input] %s sent a cheer", characterName(clientID));
+        }
+    });
+
+    events.raise({EventType::Spawn, EventPriority::High, eventClock.getTime(),
+                  clientID, clientID, "start"});
+    events.dispatch();
     {
         std::lock_guard<std::mutex> lock(sharedData.playerMutex);
         sharedData.playerX = go::getX(player);
         sharedData.playerY = go::getY(player);
     }
     if (!offline) networkThread = std::thread(networkingThread, std::ref(sharedData), clientID);
-    bool jumpKeyWasPressed = false;
-    bool restartKeyWasPressed = false;
-    bool debugKeyWasPressed = false;
-    bool showHiddenObjects = false;
     // Initialize phase before the first update so a newly joined player is not
     // carried by a large initial platform displacement.
     auto updateMovingPlatforms = [&](double seconds, bool carryRider) {
@@ -376,7 +488,7 @@ int main(int argc, char* argv[])
         return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
     };
     updateMovingPlatforms(sharedSeconds(), false);
-    SDL_Log("M3: A/D move, W/Space jump, Shift run, P pause, -/+ speed, T scale, R respawn, F1 debug");
+    SDL_Log("M4: A/D move, W/Space jump, Shift run, Q cheer, R respawn, P pause, -/+ speed, T scale, F1 debug");
     SDL_Event event;
 
     while (running) {
@@ -385,6 +497,8 @@ int main(int argc, char* argv[])
                 running = false;
             }
         }
+
+        if (!running) break;
 
         bool pausePressed = Input::isKeyPressed(SDL_SCANCODE_P);
         if (pausePressed && !pauseKeyWasPressed) {
@@ -429,75 +543,105 @@ int main(int argc, char* argv[])
         float deltaTime = static_cast<float>(gameTime.getDeltaTime());
         if (deltaTime > 0.05f) deltaTime = 0.05f;
 
-        bool restartPressed = Input::isKeyPressed(SDL_SCANCODE_R);
-        if (restartPressed && !restartKeyWasPressed) respawnPlayer();
-        restartKeyWasPressed = restartPressed;
         bool debugPressed = Input::isKeyPressed(SDL_SCANCODE_F1);
         if (debugPressed && !debugKeyWasPressed) showHiddenObjects = !showHiddenObjects;
         debugKeyWasPressed = debugPressed;
 
-        // Shared wall-clock phase matches the team's deterministic platform model.
-        // Platforms continue during a local pause, a standing rider follows them.
-        updateMovingPlatforms(sharedSeconds(), true);
-        bool jumpPressed = Input::isKeyPressed(SDL_SCANCODE_W) || Input::isKeyPressed(SDL_SCANCODE_SPACE);
-        bool jumpRequested = jumpPressed && !jumpKeyWasPressed;
-        jumpKeyWasPressed = jumpPressed;
+        // SDL polls the keys; all gameplay input goes through the team queue.
+        auto raiseOnPress = [&](bool pressed, bool& wasPressed, const char* detail) {
+            if (pressed && !wasPressed)
+                events.raise({EventType::Input, EventPriority::Normal, eventClock.getTime(),
+                              clientID, clientID, detail});
+            wasPressed = pressed;
+        };
+        raiseOnPress(Input::isKeyPressed(SDL_SCANCODE_R), restartKeyWasPressed, "restart");
+        raiseOnPress(Input::isKeyPressed(SDL_SCANCODE_Q), cheerKeyWasPressed, "cheer");
+        const double nowSeconds = sharedSeconds();
+        updateMovingPlatforms(nowSeconds, true);
+        // Use the shared wall clock so all localhost clients see the same patrol.
+        const float bombX = 2200 + 200 * std::sin(std::fmod(nowSeconds, 6.0) * 6.283185307179586 / 6.0);
+        go::setPosition(bomb, bombX, GROUND_Y - 174);
+        go::setPosition(bombBody, bombX + 22, GROUND_Y - 110);
+        raiseOnPress(Input::isKeyPressed(SDL_SCANCODE_W) || Input::isKeyPressed(SDL_SCANCODE_SPACE),
+                     jumpKeyWasPressed, "jump");
+
+        horizontalSpeed = 0;
+        if (!gameTime.isPaused()) {
+            const bool runningInput = Input::isKeyPressed(SDL_SCANCODE_LSHIFT) ||
+                                      Input::isKeyPressed(SDL_SCANCODE_RSHIFT);
+            const int direction = static_cast<int>(Input::isKeyPressed(SDL_SCANCODE_D)) -
+                                  static_cast<int>(Input::isKeyPressed(SDL_SCANCODE_A));
+            if (direction)
+                events.raise({EventType::Input, EventPriority::Normal, eventClock.getTime(),
+                              clientID, clientID, "move", direction * (runningInput ? RUN_SPEED : WALK_SPEED)});
+        }
+        events.dispatch(); // Input and network messages.
+        events.dispatch(); // Manual restart requests queued by an input handler.
 
         if (!gameTime.isPaused()) {
-            float moveSpeed = WALK_SPEED;
-            if (Input::isKeyPressed(SDL_SCANCODE_LSHIFT) || Input::isKeyPressed(SDL_SCANCODE_RSHIFT))
-                moveSpeed = RUN_SPEED;
-            int direction = static_cast<int>(Input::isKeyPressed(SDL_SCANCODE_D)) -
-                            static_cast<int>(Input::isKeyPressed(SDL_SCANCODE_A));
-            if (jumpRequested) {
-                physics.jump(player, JUMP_STRENGTH);
-                if (go::getVelocityY(player) < 0) standingOn = nullptr;
-            }
-
-            // Small physics steps prevent a fast fall from skipping thin ledges.
-            int steps = std::max(1, static_cast<int>(std::ceil(deltaTime / (1.0f / 120.0f))));
-            float stepTime = deltaTime / steps;
+            // Keep the Milestone 3 substeps. Resolve queued collisions before
+            // continuing the same substep so the player cannot sink into a ledge.
+            const int steps = std::max(1, static_cast<int>(std::ceil(deltaTime / (1.0f / 120.0f))));
+            const float stepTime = deltaTime / steps;
             for (int step = 0; step < steps && stepTime > 0; ++step) {
-                float previousX = go::getX(player);
-                float previousY = go::getY(player);
-                go::move(player, direction * moveSpeed * stepTime, 0);
+                const float previousX = go::getX(player);
+                const float previousY = go::getY(player);
+                go::move(player, horizontalSpeed * stepTime, 0);
                 for (GameObject* object : solidObjects) {
                     if (!Collision::checkCollision(player, *object)) continue;
-                    if (previousX + PLAYER_WIDTH <= go::getX(*object) + 0.5f)
-                        go::setPosition(player, go::getX(*object) - PLAYER_WIDTH, go::getY(player));
-                    else if (previousX >= go::getX(*object) + go::getWidth(*object) - 0.5f)
-                        go::setPosition(player, go::getX(*object) + go::getWidth(*object), go::getY(player));
+                    const float left = go::getX(*object);
+                    const float right = left + go::getWidth(*object);
+                    if (previousX + PLAYER_WIDTH <= left + 0.5f) {
+                        events.raise({EventType::Collision, EventPriority::High, eventClock.getTime(),
+                                      clientID, 0, "side", left - PLAYER_WIDTH});
+                        events.dispatch();
+                    } else if (previousX >= right - 0.5f) {
+                        events.raise({EventType::Collision, EventPriority::High, eventClock.getTime(),
+                                      clientID, 0, "side", right});
+                        events.dispatch();
+                    }
                 }
                 go::setPosition(player, std::clamp(go::getX(player), 0.0f,
                                 WORLD_WIDTH - PLAYER_WIDTH), go::getY(player));
                 physics.update(player, stepTime);
-                go::setGrounded(player, false);
-                standingOn = nullptr;
+
+                int landingIndex = -1;
                 float landingY = 100000;
-                for (GameObject* object : solidObjects) {
-                    bool horizontalOverlap = go::getX(player) + PLAYER_WIDTH > go::getX(*object) &&
-                        go::getX(player) < go::getX(*object) + go::getWidth(*object);
-                    if (!horizontalOverlap) continue;
-                    float top = go::getY(*object);
-                    float bottom = top + go::getHeight(*object);
+                for (std::size_t i = 0; i < solidObjects.size(); ++i) {
+                    const GameObject& object = *solidObjects[i];
+                    const bool overlap = go::getX(player) + PLAYER_WIDTH > go::getX(object) &&
+                        go::getX(player) < go::getX(object) + go::getWidth(object);
+                    if (!overlap) continue;
+                    const float top = go::getY(object);
+                    const float bottom = top + go::getHeight(object);
                     if (go::getVelocityY(player) >= 0 && previousY + PLAYER_HEIGHT <= top + 1 &&
                         go::getY(player) + PLAYER_HEIGHT >= top && top < landingY) {
                         landingY = top;
-                        standingOn = object;
+                        landingIndex = static_cast<int>(i);
                     }
                     if (go::getVelocityY(player) < 0 && previousY >= bottom - 1 && go::getY(player) < bottom) {
-                        go::setPosition(player, go::getX(player), bottom);
-                        go::setVelocityY(player, 0);
+                        events.raise({EventType::Collision, EventPriority::High, eventClock.getTime(),
+                                      clientID, 0, "ceiling", 0, bottom});
+                        events.dispatch();
                     }
                 }
-                if (standingOn) {
-                    go::setPosition(player, go::getX(player), landingY - PLAYER_HEIGHT);
-                    go::setVelocityY(player, 0);
-                    go::setGrounded(player, true);
+                if (landingIndex >= 0) {
+                    events.raise({EventType::Collision, EventPriority::High, eventClock.getTime(),
+                                  clientID, landingIndex, "land", 0, landingY});
+                    events.dispatch();
+                } else {
+                    go::setGrounded(player, false);
+                    standingOn = nullptr;
                 }
-                if (Collision::checkCollision(player, deathZone)) {
-                    respawnPlayer();
-                    SDL_Log("Death zone: returned to spawn %d", clientID);
+
+                const char* hazard = Collision::checkCollision(player, bombBody) ? "bomb" :
+                    Collision::checkCollision(player, deathZone) ? "death-zone" : nullptr;
+                if (hazard) {
+                    events.raise({EventType::Collision, EventPriority::Critical, eventClock.getTime(),
+                                  clientID, clientID, hazard, go::getX(player), go::getY(player)});
+                    events.dispatch(); // Collision -> queue Death
+                    events.dispatch(); // Death -> queue Spawn
+                    events.dispatch(); // Spawn -> reset position and velocity
                     break;
                 }
             }
@@ -551,6 +695,7 @@ int main(int argc, char* argv[])
             updateAnimation(sun, deltaTime);
             updateAnimation(tree, deltaTime);
             updateAnimation(distantTree, deltaTime);
+            updateAnimation(bomb, deltaTime);
 
             // Animate remote characters even when they are standing still
             for (int id = 1; id <= 4; ++id) {
@@ -606,6 +751,7 @@ int main(int argc, char* argv[])
         renderWorld(ledge2, renderer, cameraX);
         renderWorld(ledge3, renderer, cameraX);
         renderWorld(verticalPlatform, renderer, cameraX);
+        renderWorld(bomb, renderer, cameraX);
 
         // Render the persistent remote entities
         for (int id = 1; id <= 4; ++id) {
@@ -617,6 +763,20 @@ int main(int argc, char* argv[])
         }
 
         renderWorld(player, renderer, cameraX);
+
+        // A gold sparkle shows that this player has a cheer jump ready.
+        if (boostFrom) {
+            float sx = 1, sy = 1;
+            if (Scaling::getMode() == ScalingMode::PROPORTIONAL)
+                Scaling::getScaleFactors(outputWidth, outputHeight, sx, sy);
+            const float x = (go::getX(player) + PLAYER_WIDTH / 2 - cameraX) * sx;
+            const float y = (go::getY(player) + 12) * sy;
+            SDL_SetRenderDrawColor(renderer, 242, 170, 35, 255);
+            const SDL_FRect across{x - 12 * sx, y - 3 * sy, 24 * sx, 6 * sy};
+            const SDL_FRect upright{x - 3 * sx, y - 12 * sy, 6 * sx, 24 * sy};
+            SDL_RenderFillRect(renderer, &across);
+            SDL_RenderFillRect(renderer, &upright);
+        }
 
         // Debug outlines do not add RenderableComponent to hidden gameplay objects
         if (showHiddenObjects) {
@@ -635,10 +795,18 @@ int main(int argc, char* argv[])
             for (const auto& spawn : spawnPoints) outline(spawn);
             SDL_SetRenderDrawColor(renderer, 235, 40, 90, 255);
             outline(deathZone);
+            outline(bombBody);
             SDL_SetRenderDrawColor(renderer, 100, 170, 90, 255);
             for (GameObject* object : solidObjects) outline(*object);
         }
 
+        std::string title = windowTitle + " | " + status;
+        if (boostFrom)
+            title = windowTitle + " | Boost ready from " + characterName(boostFrom) + " | W or Space";
+        if (title != displayedTitle) {
+            SDL_SetWindowTitle(window, title.c_str());
+            displayedTitle = std::move(title);
+        }
         SDL_RenderPresent(renderer);
         SDL_Delay(1);
     }
@@ -656,6 +824,7 @@ int main(int argc, char* argv[])
     if (landTexture) SDL_DestroyTexture(landTexture);
     if (rockTexture) SDL_DestroyTexture(rockTexture);
     if (treeTexture) SDL_DestroyTexture(treeTexture);
+    if (bombTexture) SDL_DestroyTexture(bombTexture);
 
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
